@@ -1,0 +1,4 @@
+# Optional: install for cluster visualization
+# pip install scikit-learn umap-learn
+scikit-learn>=1.0
+umap-learn>=0.5.0
