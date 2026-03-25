@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate an interactive topic cluster scatter diagram from the Lumar CSV export.
+Generate an interactive topic cluster scatter diagram from a Lumar-style CSV export.
 Parses topic_similarities, positions URLs by semantic relevance, color-codes by primary topic.
 """
 
@@ -9,33 +9,57 @@ import json
 import math
 import os
 import random
+from collections import Counter
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CSV_PATH = os.path.join(SCRIPT_DIR, "full-lumar-export-with-clusters.csv")
+CSV_PATH = os.path.join(SCRIPT_DIR, "www-sourcewell-mn-gov_24-03-2026_All_Pages_basic_filtered.csv")
 OUTPUT_PATH = os.path.join(SCRIPT_DIR, "cluster_diagram.html")
 
-# Topic order for 5-dim vector (must match slot_no or topic names)
-TOPIC_ORDER = [
-    "Technical SEO at Scale",
-    "GEO / AEO (Generative / Answer Engine Optimization)",
-    "Website Accessibility at Scale",
-    "Site Speed at Scale",
-    "Content Optimization at Scale",
+# Distinct colors for dynamic topic assignment (cycles if more topics than entries)
+TOPIC_COLOR_PALETTE = [
+    "#3b82f6", "#8b5cf6", "#06b6d4", "#10b981", "#f59e0b", "#ef4444", "#ec4899",
+    "#84cc16", "#14b8a6", "#a855f7", "#f97316", "#6366f1", "#22c55e", "#eab308",
+    "#d946ef", "#0ea5e9", "#64748b", "#f43f5e", "#2dd4bf", "#c084fc", "#fb923c",
+    "#4ade80", "#38bdf8", "#f472b6", "#a3e635", "#fbbf24", "#94a3b8", "#7c3aed",
+    "#059669", "#dc2626", "#2563eb",
 ]
-TOPIC_COLORS = {
-    "Technical SEO at Scale": "#3b82f6",
-    "GEO / AEO (Generative / Answer Engine Optimization)": "#8b5cf6",
-    "Website Accessibility at Scale": "#06b6d4",
-    "Site Speed at Scale": "#10b981",
-    "Content Optimization at Scale": "#f59e0b",
-}
 
 
-def parse_csv():
-    """Parse CSV and return list of {url, page_title, topic_vector, primary_topic, primary_sim}."""
-    topic_idx = {t: i for i, t in enumerate(TOPIC_ORDER)}
+def assign_topic_colors(topic_names):
+    """Map each topic name to a distinct hex color."""
+    return {name: TOPIC_COLOR_PALETTE[i % len(TOPIC_COLOR_PALETTE)] for i, name in enumerate(topic_names)}
+
+
+def discover_topic_order(csv_path):
+    """Scan CSV and return sorted list of unique topic_name values from topic_similarities."""
+    names = set()
+    with open(csv_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            ts = row.get("topic_similarities", "").strip()
+            if not ts:
+                continue
+            try:
+                data = json.loads(ts)
+                for item in data:
+                    t = item.get("topic_name", "").strip()
+                    if t:
+                        names.add(t)
+            except (json.JSONDecodeError, TypeError):
+                pass
+    return sorted(names)
+
+
+def parse_csv(csv_path):
+    """Parse CSV and return (urls, topic_colors). Each url has topic_vector aligned to topic order."""
+    topic_order = discover_topic_order(csv_path)
+    if not topic_order:
+        return [], {}
+    topic_idx = {t: i for i, t in enumerate(topic_order)}
+    dim = len(topic_order)
+    topic_colors = assign_topic_colors(topic_order)
     urls = []
-    with open(CSV_PATH, "r", encoding="utf-8") as f:
+    with open(csv_path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             ts = row.get("topic_similarities", "").strip()
@@ -47,7 +71,7 @@ def parse_csv():
                 data = json.loads(ts)
                 if not data:
                     continue
-                vec = [0.0] * 5
+                vec = [0.0] * dim
                 best_topic, best_sim = None, 0.0
                 for item in data:
                     topic = item.get("topic_name", "")
@@ -67,17 +91,20 @@ def parse_csv():
                     })
             except (json.JSONDecodeError, KeyError):
                 pass
-    return urls
+    return urls, topic_colors
 
 
 def _embed_vectors(vectors, method, seed):
-    """Return list of (x,y) from 5-dim vectors. method: 'tsne'|'umap'|'polar'."""
+    """Return list of (x,y) from topic-dim vectors. method: 'tsne'|'umap'|'polar'."""
+    n_topics = len(vectors[0]) if vectors else 0
     if method == "tsne":
         try:
             import numpy as np
             from sklearn.manifold import TSNE
             X = np.array(vectors, dtype=np.float64)
-            embedded = TSNE(n_components=2, random_state=seed, perplexity=min(30, len(vectors) - 1)).fit_transform(X)
+            n = len(vectors)
+            perp = min(30, max(2, n - 1)) if n > 1 else 2
+            embedded = TSNE(n_components=2, random_state=seed, perplexity=perp).fit_transform(X)
             return [(float(embedded[i][0]), float(embedded[i][1])) for i in range(len(vectors))]
         except ImportError:
             method = "polar"
@@ -91,7 +118,6 @@ def _embed_vectors(vectors, method, seed):
         except ImportError:
             return None
     # polar
-    n_topics = 5
     angles = [2 * math.pi * i / n_topics - math.pi / 2 for i in range(n_topics)]
     return [
         (sum(vec[i] * math.cos(angles[i]) for i in range(n_topics)),
@@ -207,7 +233,7 @@ def escape_html(s):
     )
 
 
-def build_chart_svg(urls_with_positions, width=700, height=500):
+def build_chart_svg(urls_with_positions, topic_colors, width=700, height=500):
     """Build SVG string for one scatter chart (axes, cluster outlines, points)."""
     margin_left, margin_right = 70, 20
     margin_top, margin_bottom = 20, 55
@@ -254,7 +280,7 @@ def build_chart_svg(urls_with_positions, width=700, height=500):
     cluster_parts = []
     outlines = compute_cluster_outlines(urls_with_positions)
     for o in outlines:
-        c = TOPIC_COLORS.get(o["topic"], "#71717a")
+        c = topic_colors.get(o["topic"], "#71717a")
         cluster_parts.append(
             f'<ellipse cx="{o["cx"]:.1f}" cy="{o["cy"]:.1f}" rx="{o["rx"]:.1f}" ry="{o["ry"]:.1f}" '
             f'fill="{c}" fill-opacity="0.08" stroke="{c}" stroke-width="2" stroke-opacity="0.6"/>'
@@ -279,7 +305,7 @@ def build_chart_svg(urls_with_positions, width=700, height=500):
     # Generate scatter SVG - each point is a small circle
     static_svg_parts = []
     for i, p in enumerate(urls_with_positions):
-        c = TOPIC_COLORS.get(p["primary_topic"], "#71717a")
+        c = topic_colors.get(p["primary_topic"], "#71717a")
         static_svg_parts.append(
             f'<circle class="point" cx="{p["x"]:.1f}" cy="{p["y"]:.1f}" r="3" '
             f'fill="{c}" stroke="#27272a" stroke-width="1" data-index="{i}"/>'
@@ -293,7 +319,33 @@ def build_chart_svg(urls_with_positions, width=700, height=500):
     )
 
 
-def generate_html(urls_tsne, urls_umap, method_tsne_label="t-SNE"):
+def build_topic_counts_table(urls_for_data, topic_colors):
+    """HTML table: each primary topic and number of URLs (sorted by count descending)."""
+    counts = Counter(p["primary_topic"] for p in urls_for_data)
+    rows = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+    body_rows = []
+    for topic, cnt in rows:
+        c = topic_colors.get(topic, "#71717a")
+        body_rows.append(
+            "<tr>"
+            f'<td><span class="topic-dot" style="background:{c}"></span>{escape_html(topic)}</td>'
+            f'<td class="num">{cnt}</td>'
+            "</tr>"
+        )
+    total = len(urls_for_data)
+    return (
+        '<section class="topic-table-section" aria-label="URLs per topic">'
+        '<h2 class="topic-table-heading">URLs per primary topic</h2>'
+        '<div class="topic-table-wrap">'
+        '<table class="topic-table">'
+        '<thead><tr><th scope="col">Topic</th><th scope="col" class="num">URLs</th></tr></thead>'
+        f'<tbody>{"".join(body_rows)}</tbody>'
+        f'<tfoot><tr><td>Total</td><td class="num">{total}</td></tr></tfoot>'
+        "</table></div></section>"
+    )
+
+
+def generate_html(urls_tsne, urls_umap, topic_colors, method_tsne_label="t-SNE", page_title="Topic Cluster Scatter"):
     """Generate HTML with two side-by-side charts (t-SNE/Polar and UMAP)."""
     urls_for_data = urls_tsne if urls_tsne is not None else urls_umap
     if urls_for_data is None:
@@ -311,8 +363,8 @@ def generate_html(urls_tsne, urls_umap, method_tsne_label="t-SNE"):
     points_json = json.dumps(points_data, indent=2)
 
     chart_w, chart_h = 700, 500
-    svg_tsne = build_chart_svg(urls_tsne, chart_w, chart_h) if urls_tsne else ""
-    svg_umap = build_chart_svg(urls_umap, chart_w, chart_h) if urls_umap else ""
+    svg_tsne = build_chart_svg(urls_tsne, topic_colors, chart_w, chart_h) if urls_tsne else ""
+    svg_umap = build_chart_svg(urls_umap, topic_colors, chart_w, chart_h) if urls_umap else ""
 
     umap_placeholder = (
         '<div class="chart-placeholder">UMAP diagram requires umap-learn. Run: pip install umap-learn</div>'
@@ -321,14 +373,16 @@ def generate_html(urls_tsne, urls_umap, method_tsne_label="t-SNE"):
 
     legend_parts = "".join(
         f'<span class="legend-item"><span class="legend-dot" style="background:{c}"></span>{escape_html(t)}</span>'
-        for t, c in TOPIC_COLORS.items()
+        for t, c in sorted(topic_colors.items(), key=lambda x: x[0])
     )
+
+    topic_table_html = build_topic_counts_table(urls_for_data, topic_colors)
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Topic Cluster Scatter - Lumar</title>
+  <title>{escape_html(page_title)}</title>
   <style>
     * {{ margin: 0; padding: 0; box-sizing: border-box; }}
     body {{ font-family: system-ui, -apple-system, sans-serif; background: #0f0f12; color: #e4e4e7; min-height: 100vh; padding: 2rem; }}
@@ -359,11 +413,21 @@ def generate_html(urls_tsne, urls_umap, method_tsne_label="t-SNE"):
     .url-item .sim {{ color: #71717a; font-size: 0.7rem; }}
     .overlay {{ position: fixed; inset: 0; background: rgba(0,0,0,0.5); opacity: 0; pointer-events: none; transition: opacity 0.25s; z-index: 99; }}
     .overlay.open {{ opacity: 1; pointer-events: auto; }}
+    .topic-table-section {{ margin-top: 2.5rem; max-width: 960px; }}
+    .topic-table-heading {{ font-size: 1rem; font-weight: 600; margin-bottom: 0.75rem; color: #a1a1aa; }}
+    .topic-table-wrap {{ overflow-x: auto; border: 1px solid #27272a; border-radius: 8px; background: #18181b; }}
+    .topic-table {{ width: 100%; border-collapse: collapse; font-size: 0.8125rem; }}
+    .topic-table th, .topic-table td {{ text-align: left; padding: 0.5rem 0.75rem; border-bottom: 1px solid #27272a; vertical-align: middle; }}
+    .topic-table thead th {{ color: #a1a1aa; font-weight: 600; }}
+    .topic-table tbody tr:last-child td {{ border-bottom: none; }}
+    .topic-table td.num, .topic-table th.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+    .topic-table tfoot td {{ border-top: 1px solid #3f3f46; background: #141416; font-weight: 500; color: #e4e4e7; }}
+    .topic-dot {{ display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 0.5rem; vertical-align: middle; flex-shrink: 0; }}
   </style>
 </head>
 <body>
-  <h1>Topic Cluster Scatter</h1>
-  <p class="subtitle">URLs clustered by topic similarity. Compare t-SNE/Polar vs UMAP. Color = primary topic. Click a point for details.</p>
+  <h1>{escape_html(page_title)}</h1>
+  <p class="subtitle">URLs clustered by topic similarity (Sourcewell). Compare t-SNE/Polar vs UMAP. Color = primary topic. Click a point for details.</p>
   <div class="legend">{legend_parts}</div>
   <div class="charts-container">
     <div class="chart-wrapper">
@@ -375,6 +439,7 @@ def generate_html(urls_tsne, urls_umap, method_tsne_label="t-SNE"):
       <div id="chart-umap">{svg_umap if urls_umap else umap_placeholder}</div>
     </div>
   </div>
+  {topic_table_html}
   <div id="tooltip"></div>
   <div class="overlay" id="overlay"></div>
   <div id="url-panel">
@@ -451,15 +516,19 @@ def generate_html(urls_tsne, urls_umap, method_tsne_label="t-SNE"):
 
 
 def main():
-    urls = parse_csv()
+    urls, topic_colors = parse_csv(CSV_PATH)
+    if not urls:
+        print("No URLs with topic_similarities found; check CSV path and format.")
+        return
     urls_tsne = compute_scatter_positions(urls, method="tsne", width=700, height=500)
     urls_umap = compute_scatter_positions(urls, method="umap", width=700, height=500)
     try:
-        from sklearn.manifold import TSNE
+        from sklearn.manifold import TSNE  # noqa: F401
         method_tsne_label = "t-SNE"
     except ImportError:
         method_tsne_label = "Polar"
-    html = generate_html(urls_tsne, urls_umap, method_tsne_label)
+    page_title = "Topic Cluster Scatter — Sourcewell"
+    html = generate_html(urls_tsne, urls_umap, topic_colors, method_tsne_label, page_title=page_title)
     with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
         f.write(html)
     print(f"Generated {OUTPUT_PATH}")
