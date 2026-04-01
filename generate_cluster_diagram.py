@@ -54,7 +54,7 @@ def parse_csv(csv_path):
     """Parse CSV and return (urls, topic_colors). Each url has topic_vector aligned to topic order."""
     topic_order = discover_topic_order(csv_path)
     if not topic_order:
-        return [], {}
+        return [], {}, []
     topic_idx = {t: i for i, t in enumerate(topic_order)}
     dim = len(topic_order)
     topic_colors = assign_topic_colors(topic_order)
@@ -88,10 +88,11 @@ def parse_csv(csv_path):
                         "topic_vector": vec,
                         "primary_topic": best_topic,
                         "primary_sim": round(best_sim, 3),
+                        "topic_index": topic_idx[best_topic],
                     })
             except (json.JSONDecodeError, KeyError):
                 pass
-    return urls, topic_colors
+    return urls, topic_colors, topic_order
 
 
 def _embed_vectors(vectors, method, seed):
@@ -233,7 +234,7 @@ def escape_html(s):
     )
 
 
-def build_chart_svg(urls_with_positions, topic_colors, width=700, height=500):
+def build_chart_svg(urls_with_positions, topic_colors, topic_to_idx, width=700, height=500):
     """Build SVG string for one scatter chart (axes, cluster outlines, points)."""
     margin_left, margin_right = 70, 20
     margin_top, margin_bottom = 20, 55
@@ -281,6 +282,8 @@ def build_chart_svg(urls_with_positions, topic_colors, width=700, height=500):
     outlines = compute_cluster_outlines(urls_with_positions)
     for o in outlines:
         c = topic_colors.get(o["topic"], "#71717a")
+        tidx = topic_to_idx.get(o["topic"], 0)
+        cluster_parts.append(f'<g class="topic-cluster" data-topic-idx="{tidx}">')
         cluster_parts.append(
             f'<ellipse cx="{o["cx"]:.1f}" cy="{o["cy"]:.1f}" rx="{o["rx"]:.1f}" ry="{o["ry"]:.1f}" '
             f'fill="{c}" fill-opacity="0.08" stroke="{c}" stroke-width="2" stroke-opacity="0.6"/>'
@@ -301,14 +304,16 @@ def build_chart_svg(urls_with_positions, topic_colors, width=700, height=500):
             f'fill="{c}" font-size="11" font-weight="600" font-family="system-ui,sans-serif">'
             + "".join(tspan_parts) + "</text>"
         )
+        cluster_parts.append("</g>")
 
     # Generate scatter SVG - each point is a small circle
     static_svg_parts = []
     for i, p in enumerate(urls_with_positions):
         c = topic_colors.get(p["primary_topic"], "#71717a")
+        tidx = p.get("topic_index", 0)
         static_svg_parts.append(
             f'<circle class="point" cx="{p["x"]:.1f}" cy="{p["y"]:.1f}" r="3" '
-            f'fill="{c}" stroke="#27272a" stroke-width="1" data-index="{i}"/>'
+            f'fill="{c}" stroke="#27272a" stroke-width="1" data-index="{i}" data-topic-idx="{tidx}"/>'
         )
     return (
         f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}">'
@@ -345,11 +350,39 @@ def build_topic_counts_table(urls_for_data, topic_colors):
     )
 
 
-def generate_html(urls_tsne, urls_umap, topic_colors, method_tsne_label="t-SNE", page_title="Topic Cluster Scatter"):
+def build_topic_filters_html(topic_order, topic_colors):
+    """Checkboxes to show/hide each topic in both charts."""
+    rows = []
+    for i, topic in enumerate(topic_order):
+        c = topic_colors.get(topic, "#71717a")
+        tid = f"topic-filter-{i}"
+        rows.append(
+            '<label class="topic-filter-item">'
+            f'<input type="checkbox" class="topic-filter-cb" id="{tid}" data-topic-idx="{i}" checked />'
+            f'<span class="topic-filter-dot" style="background:{c}"></span>'
+            f'<span class="topic-filter-label">{escape_html(topic)}</span>'
+            "</label>"
+        )
+    return (
+        '<section class="topic-filters-section" aria-label="Topic visibility">'
+        '<h2 class="topic-filters-heading">Show topics</h2>'
+        '<p class="topic-filters-hint">Uncheck a topic to hide it in both charts. Hidden points are omitted from hover and clicks.</p>'
+        '<div class="topic-filters-toolbar">'
+        '<button type="button" class="topic-filters-btn" id="topic-show-all">Show all</button>'
+        '<button type="button" class="topic-filters-btn" id="topic-hide-all">Hide all</button>'
+        "</div>"
+        f'<div class="topic-filters-list">{"".join(rows)}</div>'
+        "</section>"
+    )
+
+
+def generate_html(urls_tsne, urls_umap, topic_colors, topic_order, method_tsne_label="t-SNE", page_title="Topic Cluster Scatter"):
     """Generate HTML with two side-by-side charts (t-SNE/Polar and UMAP)."""
     urls_for_data = urls_tsne if urls_tsne is not None else urls_umap
     if urls_for_data is None:
         raise ValueError("At least one chart must have data")
+
+    topic_to_idx = {t: i for i, t in enumerate(topic_order)}
 
     points_data = [
         {
@@ -357,14 +390,16 @@ def generate_html(urls_tsne, urls_umap, topic_colors, method_tsne_label="t-SNE",
             "page_title": escape_html(p["page_title"]),
             "primary_topic": p["primary_topic"],
             "primary_sim": p["primary_sim"],
+            "topic_index": p["topic_index"],
         }
         for p in urls_for_data
     ]
     points_json = json.dumps(points_data, indent=2)
+    topic_order_json = json.dumps(topic_order)
 
     chart_w, chart_h = 700, 500
-    svg_tsne = build_chart_svg(urls_tsne, topic_colors, chart_w, chart_h) if urls_tsne else ""
-    svg_umap = build_chart_svg(urls_umap, topic_colors, chart_w, chart_h) if urls_umap else ""
+    svg_tsne = build_chart_svg(urls_tsne, topic_colors, topic_to_idx, chart_w, chart_h) if urls_tsne else ""
+    svg_umap = build_chart_svg(urls_umap, topic_colors, topic_to_idx, chart_w, chart_h) if urls_umap else ""
 
     umap_placeholder = (
         '<div class="chart-placeholder">UMAP diagram requires umap-learn. Run: pip install umap-learn</div>'
@@ -377,6 +412,7 @@ def generate_html(urls_tsne, urls_umap, topic_colors, method_tsne_label="t-SNE",
     )
 
     topic_table_html = build_topic_counts_table(urls_for_data, topic_colors)
+    topic_filters_html = build_topic_filters_html(topic_order, topic_colors)
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -423,12 +459,25 @@ def generate_html(urls_tsne, urls_umap, topic_colors, method_tsne_label="t-SNE",
     .topic-table td.num, .topic-table th.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
     .topic-table tfoot td {{ border-top: 1px solid #3f3f46; background: #141416; font-weight: 500; color: #e4e4e7; }}
     .topic-dot {{ display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 0.5rem; vertical-align: middle; flex-shrink: 0; }}
+    .topic-filters-section {{ margin: 1.5rem 0 1rem; max-width: 960px; }}
+    .topic-filters-heading {{ font-size: 1rem; font-weight: 600; margin-bottom: 0.35rem; color: #a1a1aa; }}
+    .topic-filters-hint {{ font-size: 0.8125rem; color: #71717a; margin-bottom: 0.75rem; line-height: 1.4; }}
+    .topic-filters-toolbar {{ display: flex; gap: 0.5rem; margin-bottom: 0.75rem; }}
+    .topic-filters-btn {{ background: #27272a; border: 1px solid #3f3f46; color: #e4e4e7; padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.8125rem; cursor: pointer; }}
+    .topic-filters-btn:hover {{ background: #3f3f46; }}
+    .topic-filters-list {{ display: flex; flex-direction: column; gap: 0.35rem; max-height: 280px; overflow-y: auto; padding: 0.5rem; border: 1px solid #27272a; border-radius: 8px; background: #18181b; }}
+    .topic-filter-item {{ display: flex; align-items: flex-start; gap: 0.5rem; font-size: 0.8125rem; color: #d4d4d8; cursor: pointer; line-height: 1.35; }}
+    .topic-filter-item input {{ margin-top: 0.2rem; accent-color: #60a5fa; cursor: pointer; }}
+    .topic-filter-dot {{ width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; margin-top: 0.35rem; }}
+    .topic-filter-label {{ flex: 1; min-width: 0; }}
+    .point.topic-hidden, .topic-cluster.topic-hidden {{ opacity: 0; pointer-events: none; }}
   </style>
 </head>
 <body>
   <h1>{escape_html(page_title)}</h1>
   <p class="subtitle">URLs clustered by topic similarity (Sourcewell). Compare t-SNE/Polar vs UMAP. Color = primary topic. Click a point for details.</p>
   <div class="legend">{legend_parts}</div>
+  {topic_filters_html}
   <div class="charts-container">
     <div class="chart-wrapper">
       <div class="chart-title">{method_tsne_label}</div>
@@ -450,12 +499,50 @@ def generate_html(urls_tsne, urls_umap, topic_colors, method_tsne_label="t-SNE",
 
   <script>
     const pointsData = {points_json};
+    const topicOrder = {topic_order_json};
 
     function initChart() {{
       const tooltip = document.getElementById("tooltip");
+      const numTopics = topicOrder.length;
+      const topicVisible = topicOrder.map(() => true);
+
+      function applyTopicVisibility() {{
+        document.querySelectorAll("#chart-tsne [data-topic-idx], #chart-umap [data-topic-idx]").forEach((el) => {{
+          const idx = parseInt(el.getAttribute("data-topic-idx"), 10);
+          if (Number.isNaN(idx) || idx < 0 || idx >= numTopics) return;
+          el.classList.toggle("topic-hidden", !topicVisible[idx]);
+        }});
+      }}
+
+      document.querySelectorAll(".topic-filter-cb").forEach((cb) => {{
+        cb.addEventListener("change", () => {{
+          const idx = parseInt(cb.getAttribute("data-topic-idx"), 10);
+          if (!Number.isNaN(idx) && idx >= 0 && idx < numTopics) {{
+            topicVisible[idx] = cb.checked;
+            applyTopicVisibility();
+          }}
+        }});
+      }});
+      const showAll = document.getElementById("topic-show-all");
+      const hideAll = document.getElementById("topic-hide-all");
+      if (showAll) {{
+        showAll.addEventListener("click", () => {{
+          topicVisible.fill(true);
+          document.querySelectorAll(".topic-filter-cb").forEach((cb) => {{ cb.checked = true; }});
+          applyTopicVisibility();
+        }});
+      }}
+      if (hideAll) {{
+        hideAll.addEventListener("click", () => {{
+          topicVisible.fill(false);
+          document.querySelectorAll(".topic-filter-cb").forEach((cb) => {{ cb.checked = false; }});
+          applyTopicVisibility();
+        }});
+      }}
 
       document.querySelectorAll("#chart-tsne .point, #chart-umap .point").forEach((el) => {{
         el.addEventListener("mouseenter", (e) => {{
+          if (el.classList.contains("topic-hidden")) return;
           const i = parseInt(el.getAttribute("data-index"), 10);
           const p = pointsData[i];
           if (!p) return;
@@ -476,6 +563,7 @@ def generate_html(urls_tsne, urls_umap, topic_colors, method_tsne_label="t-SNE",
           tooltip.classList.remove("visible");
         }});
         el.addEventListener("click", () => {{
+          if (el.classList.contains("topic-hidden")) return;
           const i = parseInt(el.getAttribute("data-index"), 10);
           const p = pointsData[i];
           if (!p) return;
@@ -516,7 +604,7 @@ def generate_html(urls_tsne, urls_umap, topic_colors, method_tsne_label="t-SNE",
 
 
 def main():
-    urls, topic_colors = parse_csv(CSV_PATH)
+    urls, topic_colors, topic_order = parse_csv(CSV_PATH)
     if not urls:
         print("No URLs with topic_similarities found; check CSV path and format.")
         return
@@ -528,7 +616,7 @@ def main():
     except ImportError:
         method_tsne_label = "Polar"
     page_title = "Topic Cluster Scatter — Sourcewell"
-    html = generate_html(urls_tsne, urls_umap, topic_colors, method_tsne_label, page_title=page_title)
+    html = generate_html(urls_tsne, urls_umap, topic_colors, topic_order, method_tsne_label, page_title=page_title)
     with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
         f.write(html)
     print(f"Generated {OUTPUT_PATH}")
